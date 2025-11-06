@@ -10,6 +10,27 @@ import hashlib
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity  # kept to preserve functionality, even if unused
 
+# --- New: LangChain prompt imports (robust to different installs) ---
+try:
+    from langchain_core.prompts import PromptTemplate
+except Exception:
+    from langchain.prompts import PromptTemplate
+
+# --- New: PDF and HTML processing imports ---
+try:
+    import PyPDF2
+    PDF_SUPPORT = True
+except ImportError:
+    PDF_SUPPORT = False
+    print("Warning: PyPDF2 not installed. PDF files will be skipped.")
+
+try:
+    from bs4 import BeautifulSoup
+    HTML_SUPPORT = True
+except ImportError:
+    HTML_SUPPORT = False
+    print("Warning: BeautifulSoup not installed. HTML files will be skipped.")
+
 
 class LispTranslationRAG:
     def __init__(self, src_docs_path, trg_docs_path, ollama_model='deepseek-r1:70b'):
@@ -33,12 +54,71 @@ class LispTranslationRAG:
         }
         self.done_db = {
             'embeddings': np.zeros((0, 768)),
-            'samples': [],  # (code, context) tuples
+            'samples': [],  # (code, context) tuples (here: normalized source snippets)
             'text_embeddings': np.zeros((0, 768)),
             'text_chunks': [],
-            'filepaths': []  # Added missing key
+            'filepaths': []
         }
         self.translation_cache = {}
+
+    # --- New: File type detection and content extraction ---
+    def _extract_text_from_file(self, filepath):
+        """Extract text content from various file types (TXT, HTML, PDF)"""
+        ext = os.path.splitext(filepath)[1].lower()
+
+        try:
+            if ext == '.txt':
+                with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                    return f.read()
+
+            elif ext == '.html' and HTML_SUPPORT:
+                with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                    soup = BeautifulSoup(f.read(), 'html.parser')
+                    # Remove script and style elements
+                    for script in soup(["script", "style"]):
+                        script.decompose()
+                    return soup.get_text()
+
+            elif ext == '.pdf' and PDF_SUPPORT:
+                with open(filepath, 'rb') as f:
+                    reader = PyPDF2.PdfReader(f)
+                    text = ""
+                    for page in reader.pages:
+                        text += page.extract_text() + "\n"
+                    return text
+
+            else:
+                print(f"Warning: Unsupported file type or missing dependency: {filepath}")
+                return ""
+
+        except Exception as e:
+            print(f"Error reading file {filepath}: {str(e)}")
+            return ""
+
+    def _process_directory(self, dir_path):
+        """Process all supported files in a directory and return combined content"""
+        if not os.path.exists(dir_path):
+            print(f"Error: Directory {dir_path} does not exist")
+            return ""
+
+        all_content = []
+
+        # Process all supported file types
+        for pattern in ['*.txt', '*.html', '*.pdf']:
+            for filepath in glob.glob(os.path.join(dir_path, '**', pattern), recursive=True):
+                print(f"Processing: {filepath}")
+                content = self._extract_text_from_file(filepath)
+                if content.strip():
+                    all_content.append(f"\n--- Content from {os.path.basename(filepath)} ---\n")
+                    all_content.append(content)
+
+        # Also check if the path itself is a file
+        if os.path.isfile(dir_path):
+            content = self._extract_text_from_file(dir_path)
+            if content.strip():
+                all_content.append(content)
+
+        return "\n".join(all_content)
 
     # --- Persistence for context DBs --------------------------------------
 
@@ -121,68 +201,65 @@ class LispTranslationRAG:
 
     def _extract_code_context_pairs(self, text):
         """Extract (code, context) pairs from documentation"""
-        # Split text into logical sections
         sections = re.split(r'\n\s*\n', text)
         pairs = []
-
         for section in sections:
-            # Find all code blocks in this section
             code_blocks = re.findall(r'(?:^|\n)(?:;+\s*Example:?\s*)?(\(.*?\))(?=\n|$)', section, re.DOTALL)
             if code_blocks:
-                # Use the entire section as context for these code blocks
-                context = re.sub(r'(\(.*?\))', '', section)  # Remove code from context
+                context = re.sub(r'(\(.*?\))', '', section)
                 context = ' '.join(context.split()).strip()
                 for code in code_blocks:
                     if code.strip():
                         pairs.append((code.strip(), context))
-
         return pairs
 
-    def _process_doc_file(self, filepath):
-        """Process documentation file into (code, context) pairs and text chunks"""
-        if not os.path.exists(filepath):
-            print(f"Error: Documentation file {filepath} not found")
-            return [], []
-        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read()
-
-            # Extract code-context pairs
-            code_context_pairs = self._extract_code_context_pairs(content)
-
-            # Also extract pure text chunks for conceptual understanding
-            text_chunks = [
-                chunk.strip() for chunk in
-                re.split(r'\n\s*\n', re.sub(r'\(.*?\)', '', content))  # Remove code blocks
-                if chunk.strip() and len(chunk.split()) > 5  # Only keep meaningful text
-            ]
-
-            return code_context_pairs, text_chunks
+    def _process_doc_content(self, content, source_name="document"):
+        """Process documentation content into (code, context) pairs and text chunks"""
+        code_context_pairs = self._extract_code_context_pairs(content)
+        text_chunks = [
+            chunk.strip() for chunk in
+            re.split(r'\n\s*\n', re.sub(r'\(.*?\)', '', content))
+            if chunk.strip() and len(chunk.split()) > 5
+        ]
+        return code_context_pairs, text_chunks
 
     def _build_enhanced_database(self, doc_path, db):
-        """Build database with both code-context pairs and text chunks"""
-        code_context_pairs, text_chunks = self._process_doc_file(doc_path)
+        """Build database with both code-context pairs and text chunks from files or directories"""
+        # Clear the database first
+        db['embeddings'] = np.zeros((0, 768))
+        db['samples'] = []
+        db['text_embeddings'] = np.zeros((0, 768))
+        db['text_chunks'] = []
+
+        # Extract content from the path (file or directory)
+        if os.path.isdir(doc_path):
+            content = self._process_directory(doc_path)
+        else:
+            content = self._extract_text_from_file(doc_path)
+
+        if not content.strip():
+            print(f"Warning: No content extracted from {doc_path}")
+            return
+
+        code_context_pairs, text_chunks = self._process_doc_content(content, doc_path)
 
         # Process code-context pairs
         for code, context in code_context_pairs:
             try:
-                # Embed both code and context
                 code_embedding = self.model.encode(code).reshape(1, -1)
                 context_embedding = self.model.encode(context).reshape(1, -1)
 
-                # Store code with its context
                 if db['embeddings'].shape[0] == 0:
                     db['embeddings'] = code_embedding
                 else:
                     db['embeddings'] = np.vstack([db['embeddings'], code_embedding])
                 db['samples'].append((code, context))
 
-                # Also store context separately
                 if db['text_embeddings'].shape[0] == 0:
                     db['text_embeddings'] = context_embedding
                 else:
                     db['text_embeddings'] = np.vstack([db['text_embeddings'], context_embedding])
                 db['text_chunks'].append(context)
-
             except Exception as e:
                 print(f"Error processing sample: {str(e)}")
 
@@ -250,7 +327,6 @@ class LispTranslationRAG:
 
     def _preprocess_code(self, code):
         """Normalize code for consistent processing"""
-        # Remove comments and extra whitespace
         code = re.sub(r';.*', '', code)  # Remove Lisp line comments
         code = re.sub(r'\s+', ' ', code).strip()  # Normalize whitespace
         return code
@@ -280,39 +356,68 @@ class LispTranslationRAG:
         with open(path, 'w', encoding='utf-8') as f:
             f.write(content)
 
-    # --- Prompt builder ----------------------------------------------------
+    # --- Prompt builder (LangChain) ---------------------------------------
 
-    def _generate_contextual_prompt(self, source_code):
-        """Generate prompt using all three databases"""
-        prompt_parts = [
-            "Translate this Lisp code to modern Common Lisp while preserving all functionality.",
-            "The first knowledge source provided shall help you understand what this lisp code actually does, the second language source describes the target implementation, so adhere to it in your answers. The third knowledge source represents what you have done so far: You must always remain consistent to it!",
-            "While translating this Common Lisp code, always proceed step by step: What is the expected input? What does the source code you shall translate do? How do you preserve all its functionality using the target implementation?",
-            "The Lisp code you shall translate into modern Common Lisp, while preserving all it's functionality is as follows:"
-        ]
+    def _generate_contextual_prompt_with_langchain(self, source_code):
+        """
+        Generate the final prompt using LangChain PromptTemplate.
+        Pulls up to 3 examples from each DB (source, target, done) just like before.
+        """
+        # Example snippet templates
+        example_tmpl = PromptTemplate(
+            input_variables=["context", "code"],
+            template="Context: {context}\nCode: {code}"
+        )
+        prev_tmpl = PromptTemplate(
+            input_variables=["snippet"],
+            template="{snippet}"
+        )
 
-        # Add source examples
-        if self.src_db['samples']:
-            prompt_parts.append("\nSource Examples:")
-            for code, ctx in self.src_db['samples'][:3]:
-                prompt_parts.append(f"\nContext: {ctx}\nCode: {code}")
+        # Render Source Examples (up to 3)
+        src_examples = []
+        for code, ctx in self.src_db['samples'][:3]:
+            src_examples.append(example_tmpl.format(context=ctx, code=code))
+        src_block = "\n\n".join(src_examples) if src_examples else "None"
 
-        # Add target examples
-        if self.trg_db['samples']:
-            prompt_parts.append("\nTarget Examples:")
-            for code, ctx in self.trg_db['samples'][:3]:
-                prompt_parts.append(f"\nContext: {ctx}\nCode: {code}")
+        # Render Target Examples (up to 3)
+        trg_examples = []
+        for code, ctx in self.trg_db['samples'][:3]:
+            trg_examples.append(example_tmpl.format(context=ctx, code=code))
+        trg_block = "\n\n".join(trg_examples) if trg_examples else "None"
 
-        # Add previously done translations
+        # Render Previous Translations (up to 3 most recent)
+        prev_examples = []
         if self.done_db['samples']:
-            prompt_parts.append("\nPrevious Translations:")
-            for sample in self.done_db['samples'][-3:]:  # Show most recent
-                prompt_parts.append(f"\n{sample}")
+            for snippet in self.done_db['samples'][-3:]:
+                prev_examples.append(prev_tmpl.format(snippet=snippet))
+        prev_block = "\n\n".join(prev_examples) if prev_examples else "None"
 
-        prompt_parts.append(f"\nCode to translate:\n{source_code}")
-        prompt_parts.append("\nProvide the translated code in a ```lisp block and explanations in a ```comments block. If you include chain-of-thought or hidden reasoning, wrap it in <think>...</think> (or a ```think block).")
+        # Overall instruction template
+        overall_tmpl = PromptTemplate(
+            input_variables=["source_examples", "target_examples", "previous_translations", "code_to_translate"],
+            template=(
+                "Translate this Lisp code to modern Common Lisp while preserving all functionality.\n"
+                "The first knowledge source provided shall help you understand what this lisp code actually does, "
+                "the second language source describes the target implementation, so adhere to it in your answers. "
+                "The third knowledge source represents what you have done so far: You must always remain consistent to it!\n\n"
+                "While translating this Common Lisp code, always proceed step by step: "
+                "What is the expected input? What does the source code you shall translate do? "
+                "How do you preserve all its functionality using the target implementation?\n\n"
+                "Source Examples:\n{source_examples}\n\n"
+                "Target Examples:\n{target_examples}\n\n"
+                "Previous Translations:\n{previous_translations}\n\n"
+                "Code to translate:\n{code_to_translate}\n\n"
+                "Provide the translated code in a ```lisp block and explanations in a ```comments block. "
+                "If you include chain-of-thought or hidden reasoning, wrap it in <think>...</think> (or a ```think block)."
+            )
+        )
 
-        return '\n'.join(prompt_parts)
+        return overall_tmpl.format(
+            source_examples=src_block,
+            target_examples=trg_block,
+            previous_translations=prev_block,
+            code_to_translate=source_code
+        )
 
     # --- Translation methods ----------------------------------------------
 
@@ -328,19 +433,18 @@ class LispTranslationRAG:
             if file_hash in self.translation_cache:
                 translated_code, comments, think = self.translation_cache[file_hash]
                 base_path = os.path.splitext(input_path)[0]
-                # Ensure files exist (write now, since we have the full cached output)
                 self._write_output(f"{base_path}.autot", translated_code)
                 self._write_output(f"{base_path}.comment", comments)
                 if think:
                     self._write_output(f"{base_path}.think", think)
                 return translated_code, comments
 
-            prompt = self._generate_contextual_prompt(source_code)
+            # --- Build prompt with LangChain ---
+            prompt = self._generate_contextual_prompt_with_langchain(source_code)
 
             # --- Generate with/without streaming ---
             full_output = ""
             if verbose:
-                # Stream chunks and print in realtime
                 stream = ollama.generate(
                     model=self.ollama,
                     prompt=prompt,
@@ -352,7 +456,7 @@ class LispTranslationRAG:
                     if part:
                         full_output += part
                         print(part, end='', flush=True)
-                print()  # newline after stream
+                print()
             else:
                 resp = ollama.generate(
                     model=self.ollama,
@@ -421,13 +525,13 @@ class LispTranslationRAG:
 def parse_args():
     parser = argparse.ArgumentParser(description="Translate Lisp code to modern Common Lisp using RAG + Ollama.")
     # Docs for building context on first run
-    parser.add_argument('-s', '--src-docs', default='./src_docs.txt', help='Path to source language docs')
-    parser.add_argument('-t', '--trg-docs', default='./trg_docs_2.txt', help='Path to target language docs')
+    parser.add_argument('-s', '--src-docs', default='./src_docs.txt', help='Path to source language docs (file or directory containing TXT, HTML, PDF files)')
+    parser.add_argument('-t', '--trg-docs', default='./trg_docs_2.txt', help='Path to target language docs (file or directory containing TXT, HTML, PDF files)')
     # Model & input
     parser.add_argument('-m', '--model', default='deepseek-r1:70b', help='Ollama model to use')
     parser.add_argument('-i', '--input-dir', default='./symbolics/sys.sct', help='Directory of .lisp* files to translate')
     parser.add_argument('-v', '--verbose', action='store_true', help='Print LLM output to STDOUT in realtime as it is generated')
-    # NEW: Context DB file paths
+    # Context DB file paths
     parser.add_argument('--src', default='src_db.json', help='Path to save/load the SOURCE context DB (JSON)')
     parser.add_argument('--trg', default='trg_db.json', help='Path to save/load the TARGET context DB (JSON)')
     return parser.parse_args()
@@ -441,9 +545,7 @@ if __name__ == '__main__':
         ollama_model=args.model
     )
 
-    # Load existing context DBs or build from docs and save to the requested paths
     translator.prepare_context_dbs(args.src, args.trg)
     translator._load_done_db()  # optional: load done DB if present
 
-    # Run translation
     translator.translate_directory(args.input_dir, verbose=args.verbose)
